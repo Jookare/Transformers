@@ -151,7 +151,18 @@ class TransformerEncoderLayer(nn.Module):
         x = x + self.mlp(norm2)
         x = self.dropout2(x)
         return x
+    
+class MLPHead(nn.Module):
+    def __init__(self, embedding_dim, num_classes):
+        super(MLPHead, self).__init__()
+        self.num_classes = num_classes
         
+        # single linear layer
+        self.mlp_head = nn.Linear(embedding_dim, num_classes)
+        
+    def forward(self, x):
+        x = self.mlp_head(x)
+        return x
 
 class ViT_torch(nn.Module):
     def __init__(self, embed_dim, patch_size, num_patches, dropout, in_channels, num_heads, num_encoders, hidden_dim, num_classes):
@@ -162,7 +173,7 @@ class ViT_torch(nn.Module):
         self.transformer_encoder_layers = nn.Sequential(*transformer_encoder_list)
         
         # mlp head
-        self.mlp_head = MLP(embed_dim, num_classes)
+        self.mlp_head = MLPHead(embed_dim, num_classes)
         
     def forward(self, x):
         # Embed the input

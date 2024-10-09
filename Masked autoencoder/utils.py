@@ -1,184 +1,157 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+
+import timm
+from timm.models.layers import trunc_normal_
+from timm.models.vision_transformer import Block
+
+from einops import repeat, rearrange
+from einops.layers.torch import Rearrange
+
+
+def random_indexes(size : int):
+    forward_indexes = np.arange(size)
+    np.random.shuffle(forward_indexes)
+    backward_indexes = np.argsort(forward_indexes)
+    return forward_indexes, backward_indexes
+
+def take_indexes(sequences, indexes):
+    return torch.gather(sequences, 0, repeat(indexes, 't b -> t b c', c=sequences.shape[-1]))
+
+class PatchShuffle(torch.nn.Module):
+    def __init__(self, ratio) -> None:
+        super().__init__()
+        self.ratio = ratio
+
+    def forward(self, patches : torch.Tensor):
+        T, B, C = patches.shape
+        remain_T = int(T * (1 - self.ratio))
+
+        indexes = [random_indexes(T) for _ in range(B)]
+        forward_indexes = torch.as_tensor(np.stack([i[0] for i in indexes], axis=-1), dtype=torch.long).to(patches.device)
+        backward_indexes = torch.as_tensor(np.stack([i[1] for i in indexes], axis=-1), dtype=torch.long).to(patches.device)
+
+        patches = take_indexes(patches, forward_indexes)
+        patches = patches[:remain_T]
+
+        return patches, forward_indexes, backward_indexes
 
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, embed_dim, patch_size, num_patches, dropout, in_channels):
+    def __init__(self, image_size, patch_size, emb_dim, in_channels):
         super().__init__()
 
         # Returns a patched output of size [batch, embed_dim, n_patch_col, n_patch_row]
-        self.patcher = nn.Sequential(
-            nn.Conv2d(
+        self.patchify = nn.Conv2d(
                 in_channels=in_channels,
-                out_channels=embed_dim,
+                out_channels=emb_dim,
                 kernel_size=patch_size,
                 stride=patch_size,
-            ),
-            nn.Flatten(2)
-        )
+            )
         
-        self.cls_token = nn.Parameter(torch.randn(size=(1, 1, embed_dim)), requires_grad=True)
-        self.pos_embedding = nn.Parameter(torch.randn(size=(1, num_patches + 1, embed_dim)), requires_grad=True) # +1 for cls token
-        self.dropout = nn.Dropout(p=dropout)
+        self.pos_embedding = nn.Parameter(torch.zeros((image_size // patch_size) ** 2, 1, emb_dim))
 
-    def forward(self, x):
-        # Transform to [batch, n_patches, emb_dim]
-        x = self.patcher(x).permute(0, 2, 1)
+        self.init_weight()
         
-        # Expand the cls_token for each element in batch and add that as the first element in dim=1
-        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_token, x), dim=1)
-        
-        # Apply the position embedding and dropout
-        x += self.pos_embedding
-        x = self.dropout(x)
-        return x
-
-class SelfAttention(nn.Module):
-    def __init__(self, embed_dim, key_dim):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.key_dim = key_dim
-        
-        # Use one matrix for Key, Query, Value weight matrices
-        self.W = nn.Parameter(torch.empty(embed_dim, 3*key_dim))
-        self.softmax = nn.Softmax(dim = -1)
-    
-        # Initialize weights
-        self._init_weights()
-    
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.W)
+    def init_weight(self):
+        nn.init.trunc_normal_(self.pos_embedding, std=.02)
         
     def forward(self, x):
-        QKV = torch.matmul(x, self.W)
-        Q = QKV[:, :, :self.key_dim]
-        K = QKV[:, :, self.key_dim:self.key_dim*2 ]
-        V = QKV[:, :, self.key_dim*2:]
+        # Get embedded patches
+        patches = self.patchify(x)
         
-        # Scaled dot product
-        K_T = K.transpose(-2, -1)
-        dot_product = torch.matmul(Q, K_T) 
+        # t = (h w) = Number of patches, b = batch size, c = embedding dimension 
+        patches = rearrange(patches, 'b c h w -> (h w) b c')
         
-        # Scaled dot product
-        Z = dot_product / (self.key_dim ** 0.5)
+        # Add positional embedding
+        patches = patches + self.pos_embedding
         
-        # Apply softmax to obtain attention scores
-        score = self.softmax(Z)
-        
-        # Get weighted values
-        output = torch.matmul(score, V)
-        
-        return output
-        
-# Multi head attention
-class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_dim=768, num_heads=12):
+        return patches
+
+
+class MAE_Encoder(nn.Module):
+    def __init__(self, image_size=32, patch_size=4, emb_dim=192, in_channels=1, num_layer=12, num_head=3, mask_ratio=0.75):
         super().__init__()
-        self.num_heads = num_heads
-        self.embed_dim = embed_dim
+
+        self.cls_token = torch.nn.Parameter(torch.zeros(1, 1, emb_dim))
+        self.shuffle = PatchShuffle(mask_ratio)
         
-        assert embed_dim % num_heads == 0, "Embedding dimension should be divisible with the number of heads"
-        self.key_dim = embed_dim // num_heads
+        self.patcher = PatchEmbedding(image_size, patch_size, emb_dim, in_channels)
         
-        # Init multihead-attention
-        self.multi_head_attention = nn.ModuleList([SelfAttention(embed_dim, self.key_dim) for _ in range(num_heads)])
+        self.transformer = torch.nn.Sequential(*[Block(emb_dim, num_head) for _ in range(num_layer)])
+        self.layer_norm = torch.nn.LayerNorm(emb_dim)
+
+        self.init_weight()
         
-        # Multihead-attention weight
-        self.W = nn.Parameter(torch.empty((embed_dim, embed_dim)))
-        
-        # Initialize weights
-        self._init_weights()
-    
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.W)
+    def init_weight(self):
+        nn.init.trunc_normal_(self.cls_token, std=.02)
         
     def forward(self, x):
-        # Compute self-attention scores of each head 
-        scores = [attention(x) for attention in self.multi_head_attention]
+        # Get embedded patches
+        patches = self.patcher(x)
         
-        # Concat attentions
-        Z = torch.cat(scores, -1)
+        # Mask tokens using shuffling
+        patches, forward_indexes, backward_indexes = self.shuffle(patches)
         
-        # Compute multi-head attention score
-        attention_score = torch.matmul(Z, self.W)
+        # Expand cls_token for each img in batch
+        patches = torch.cat([self.cls_token.expand(-1, patches.shape[1], -1), patches], dim=0)
         
-        return attention_score
-
-class MLP(nn.Module):
-    def __init__(self, embed_dim, hidden_dim, dropout):
-        super().__init__()
-        self.fc1 = nn.Linear(embed_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, embed_dim)
+        # Batch first, encode using transformer, and N_patches first
+        patches = rearrange(patches, 't b c -> b t c')
+        features = self.layer_norm(self.transformer(patches))
+        features = rearrange(features, 'b t c -> t b c')
         
-        self.gelu = nn.GELU()
-        self.dropout1 = nn.Dropout(p = dropout)
-        self.dropout2 = nn.Dropout(p = dropout)
-        
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.gelu(x)
-        x = self.dropout1(x)
-        
-        x = self.fc2(x)
-        x = self.dropout2(x)
-        return x
-        
-        
-
-class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, hidden_dim, dropout):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        
-        self.dropout1 = nn.Dropout(p=dropout)
-        self.dropout2 = nn.Dropout(p=dropout)
-        
-        self.mlp = MLP(embed_dim, hidden_dim, dropout)
-        self.attention = MultiHeadAttention(embed_dim, num_heads)
-        
-    def forward(self,x):
-        norm1 = self.norm1(x)
-        
-        # Skip connection 1
-        attention = self.attention(norm1)
-        x = x + self.dropout1(attention)
+        return features, backward_indexes
     
-        # Skip connection 2
-        norm2 = self.norm2(x)
-        x = x + self.mlp(norm2)
-        x = self.dropout2(x)
-        return x
-        
-
-class ViT_torch(nn.Module):
-    def __init__(self, embed_dim, patch_size, num_patches, dropout, in_channels, num_heads, num_encoders, hidden_dim, num_classes):
-        super().__init__()
-        self.embedding = PatchEmbedding(embed_dim, patch_size, num_patches, dropout, in_channels)
-                
-        transformer_encoder_list = [TransformerEncoderLayer(embed_dim, num_heads, hidden_dim, dropout) for _ in range(num_encoders)] 
-        self.transformer_encoder_layers = nn.Sequential(*transformer_encoder_list)
-        
-        # mlp head
-        self.mlp_head = MLP(embed_dim, num_classes)
-        
-    def forward(self, x):
-        # Embed the input
-        patched_embeds = self.embedding(x)
-        
-        # feed patch embeddings into a stack of Transformer encoders
-        encoder_output = self.transformer_encoder_layers(patched_embeds)
-        
-        # extract [class] token from encoder output
-        output_class_token = encoder_output[:, 0]
-        
-        # pass token through mlp head for classification
-        y = self.mlp_head(output_class_token)
-        
-        return(y)
     
+class MAE_Decoder(nn.Module):
+    def __init__(self, image_size=32, patch_size=4, emb_dim=192, in_channels=1, num_layer=12, num_head=3):
+        super().__init__()
         
+        self.mask_token = torch.nn.Parameter(torch.zeros(1, 1, emb_dim))
+        self.pos_embedding = nn.Parameter(torch.zeros((image_size // patch_size) ** 2 + 1, 1, emb_dim)) # + 1 for cls_token
         
+        self.transformer = torch.nn.Sequential(*[Block(emb_dim, num_head) for _ in range(num_layer)])
         
+        self.head = torch.nn.Linear(emb_dim, in_channels * patch_size ** 2)
+        
+        self.patch2img = Rearrange('(h w) b (c p1 p2) -> b c (h p1) (w p2)', p1=patch_size, p2=patch_size, h=image_size//patch_size)
+        self.init_weight()
+
+    def init_weight(self):
+        nn.init.trunc_normal_(self.mask_token, std=.02)
+        nn.init.trunc_normal_(self.pos_embedding, std=.02)
+
+    def forward(self, features, backward_indexes):
+        # Number of patches
+        T = features.shape[0]
+        
+        # Add backward indices (zeros) for cls_token
+        backward_indexes = torch.cat([torch.zeros(1, backward_indexes.shape[1]).to(backward_indexes), backward_indexes + 1], dim=0)
+        
+        # Add masked tokens to feature vector
+        features = torch.cat([features, self.mask_token.expand(backward_indexes.shape[0] - features.shape[0], features.shape[1], -1)], dim=0)
+        
+        # Add features to the correct places
+        features = take_indexes(features, backward_indexes) 
+        
+        # Add positional Embedding
+        features = features + self.pos_embedding
+        
+        # Rearrange batch first for decoding
+        features = rearrange(features, 't b c -> b t c')
+        features = self.transformer(features)
+        features = rearrange(features, 'b t c -> t b c')
+        features = features[1:] # remove global feature
+        
+        # Features to image size
+        patches = self.head(features)
+        mask = torch.zeros_like(patches)
+        mask[T-1:] = 1
+        mask = take_indexes(mask, backward_indexes[1:] - 1)
+        img = self.patch2img(patches)
+        mask = self.patch2img(mask)
+        
+        return img, mask
