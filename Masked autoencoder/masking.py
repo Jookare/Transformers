@@ -12,6 +12,8 @@ def saliency_guided_masking(x, base_mask_ratio, mask_ratio_var, delta):
     aff = torch.einsum('nip,njp->nij', x, x)
     print(aff.shape)
     aff = nn.functional.softmax(aff, dim=2)
+    
+    print(aff.shape)
     aff_sum = torch.sum(aff, dim=1)
 
     aff_sum_normalized = (aff_sum - aff_sum.min(dim=1, keepdim=True)[0]) / \
