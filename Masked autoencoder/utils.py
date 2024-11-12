@@ -101,9 +101,6 @@ class MAE_Encoder(nn.Module):
         # Get embedded patches, and use shuffling to mask patches.
         patches = self.patch_embed(x)
         patches, forward_indexes, backward_indexes = self.shuffle(patches)
-        print(patches.shape)
-        print(forward_indexes.shape)
-        print(backward_indexes.shape)
 
         # Expand cls_token for each img in batch
         patches = torch.cat([self.cls_token.expand(-1, patches.shape[1], -1), patches], dim=0)
