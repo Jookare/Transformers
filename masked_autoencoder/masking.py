@@ -26,7 +26,7 @@ def saliency_guided_masking(x, base_mask_ratio, mask_ratio_var, delta):
 
     print(dynamic_mask_ratios)
     # Add random noise for stochasticity
-    noise = torch.rand(B, N , device=x.device)
+    noise = torch.rand(B, N , device=x.device) / 2
     saliency_guided_noise = aff_sum_normalized + noise
 
     # Sorting indices by saliency
